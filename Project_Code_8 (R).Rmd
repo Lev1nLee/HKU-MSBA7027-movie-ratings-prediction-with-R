@@ -1,0 +1,884 @@
+---
+title: "MSBA7027Project"
+author: "Levin"
+date: "2021/12/2"
+output:
+  html_document:
+    highlight: haddock
+    theme: lumen
+    toc: yes
+    toc_depth: 4
+    toc_float: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+if(!require('pacman')) {
+  install.packages('pacman')
+}
+pacman::p_load(dplyr,GGally,rsample,caret,recipes,gam,ranger,gbm,xgboost,vip,pdp,ggplot2,tidyverse,boot)
+```
+
+# Step 0: Data Loading
+
+## Data Loading and EDA
+
+```{r}
+#load the movie ratings csv data file generated from Python after processing the 4 row data tables and visualize the data structure
+movies_ratings_data <- read.csv('imdb_movie_ratings_1214.csv')
+str(movies_ratings_data,list.len=ncol(movies_ratings_data))
+```
+
+## Data Wrangling
+
+```{r}
+#observe whether the data contain missing values and delete columns with too many missing values
+apply(movies_ratings_data, 2, function(x) sum(is.na(x)))
+
+movies_ratings_data <- subset(movies_ratings_data,select=-c(imdb_title_id,adjust_budget_usd,adjust_worlwide_income_usd,metascore,votes_pct_0age))
+movies_ratings_data$bigshot_importance[is.na(movies_ratings_data$bigshot_importance)] <- 0
+
+apply(movies_ratings_data, 2, function(x) sum(is.na(x)))
+```
+
+```{r}
+#visualze the data structure again after data wrangling
+str(movies_ratings_data,list.len=ncol(movies_ratings_data))
+```
+
+```{r}
+#visualize the distribution of response variable
+hist(movies_ratings_data$avg_vote)
+```
+
+# Step 1 - Data Splitting
+
+```{r}
+#perform training-test splitting (stratified, 6/4) and visualize the train and test data structure 
+set.seed(7027001)
+movies_ratings_data_stratsplit <- initial_split(movies_ratings_data,prop=0.6,strata='avg_vote')
+movies_ratings_train <- training(movies_ratings_data_stratsplit)
+movies_ratings_test <- testing(movies_ratings_data_stratsplit)
+str(movies_ratings_train)
+str(movies_ratings_test)
+```
+
+```{r}
+#check stratified sampling for means and variances of the response variable in the training/test sets
+mean(movies_ratings_train$avg_vote)
+mean(movies_ratings_test$avg_vote)
+var(movies_ratings_train$avg_vote)
+var(movies_ratings_test$avg_vote)
+```
+
+# Step 2 - (Data Preprocessing) Blueprint on Training Set
+
+```{r}
+#set "avg_vote" as response and other variables as predictors
+response <- 'avg_vote'
+predictors <- setdiff(colnames(movies_ratings_train),response)
+n_features <- length(predictors)
+```
+
+```{r}
+#select the one hot variables to be eliminated from normalization in the blueprint
+predictors_onehot <- 
+  c(colnames(movies_ratings_train)[which(colnames(movies_ratings_train)=='Action'):which(colnames(movies_ratings_train)=='Studio_Other')])
+
+#create the blueprint
+blueprint <- recipe(avg_vote~.,data=movies_ratings_train) %>%
+  step_nzv(all_predictors(),-c(predictors_onehot,director_writer)) %>%
+  step_impute_mean(all_predictors()) %>% 
+  step_log(all_numeric_predictors(),-c(predictors_onehot,director_writer),offset=1) %>% 
+  step_center(all_numeric_predictors(),-c(predictors_onehot,director_writer)) %>%
+  step_scale(all_numeric_predictors(),-c(predictors_onehot,director_writer)) %>% 
+  step_dummy(all_nominal_predictors(),one_hot=T)
+```
+
+```{r}
+# prepare baked training/test data
+prepare <- prep(blueprint,training=movies_ratings_train)
+
+movies_ratings_bakedtrain <- bake(prepare,new_data=movies_ratings_train)
+movies_ratings_bakedtest <- bake(prepare,new_data=movies_ratings_test)
+
+#visualise the baked training/test data structure
+str(movies_ratings_bakedtrain)
+str(movies_ratings_bakedtest)
+```
+
+# Step 3: Resampling Method
+
+```{r}
+#set our resampling method to be a 5-fold cross-validation of 1-repeat in light of the large IMDb data set
+cv <- trainControl(
+  method='repeatedcv',
+  number=5,
+  repeats=1
+)
+```
+
+# Step 4: Model Training: Hyperparameter Search Grid Design and Grid Search Execution
+
+## Hyperparameter Search Grid Design
+
+### KNN
+
+```{r}
+hyper_grid_KNN <- expand.grid(k=floor(seq(1,200,length.out=20)))
+```
+
+### gamSpline
+
+```{r}
+hyper_grid_gamSpline <- expand.grid(df=seq(2,20,by=2))
+```
+
+### RF, Basic GBM, and XGBoost
+
+```{r}
+# See below with Model Training.
+```
+
+## Model Training
+
+### Linear Regression
+
+```{r,warning=FALSE}
+#perform linear regression on all variables selected
+set.seed(7027002)
+movies_ratings_Linear <- train(
+  blueprint,
+  data=movies_ratings_train,
+  method='lm',
+  trControl=cv,
+  metric='RMSE'
+)
+```
+
+### KNN
+
+```{r}
+#perform KNN on all variables selected
+set.seed(7027003)
+movies_ratings_KNN <- train(
+  blueprint,
+  data=movies_ratings_train,
+  method='knn',
+  trControl=cv,
+  tuneGrid=hyper_grid_KNN,
+  metric='RMSE'
+)
+```
+
+### GAM Spline
+
+```{r}
+#perform GAM Spline on all variables selected
+set.seed(7027004)
+movies_ratings_gamSpline <- train(
+  blueprint,
+  data=movies_ratings_train,
+  method='gamSpline',
+  trControl=cv,
+  tuneGrid=hyper_grid_gamSpline,
+  metric='RMSE'
+)
+```
+
+### GAM
+
+```{r}
+# Perform GAM after tuning through repetitively adjusting each term of the model fit
+fit.gam <- glm(formula = avg_vote ~ bs(year, df = 7) + bs(month, df = 5) +
+                bs(duration, df = 5) + bs(votes, df = 16) + 
+                bs(bigshot_importance, df = 7) + director_writer + 
+                Action + Adventure + Animation + Biography + Comedy + Documentary + 
+                Drama + Film.Noir + Horror + Music +Romance + Family +
+                Sci.Fi + Thriller + Western + English + French +
+                Spanish + Japanese + Hindi + Russian + Mandarin + Turkish + 
+                Cantonese + Portuguese + Korean + Arabic + Swedish + Language_Other + 
+                USA + UK + India + Italy + Germany + Japan + Spain + Hong.Kong + 
+                Belgium + South.Korea + West.Germany + Russia + 
+                Denmark + Country_Other + 
+                Columbia.Pictures + Paramount.Pictures +
+                Studio_Other + Twentieth.Century.Fox + Universal.Pictures + 
+                votes_pct_male + votes_pct_female + 
+                votes_pct_30age + votes_pct_45age +
+                director_writer*year + 
+                Romance*votes_pct_male + duration*votes + India*Comedy + USA*Romance +
+                Japanese*Animation + Hong.Kong*Crime + year:Hong.Kong + year:Japan + 
+                votes_pct_45age*Sci.Fi + votes_pct_18age*Thriller + votes_pct_18age*Crime +
+                votes_pct_30age*War + French*Action + 
+                Drama:votes + Horror:month + year:bigshot_importance + 
+                Comedy:English + Action:Cantonese + Drama:Korean + reviews_from_users +
+                reviews_from_critics, 
+              data = movies_ratings_bakedtrain)
+```
+
+### RF
+
+```{r}
+#customized RF training method
+customRF <- list(type = 'Regression',
+                 library = 'ranger',
+                 loop = NULL)
+
+customRF$parameters <- data.frame(parameter = c('num.trees', 'mtry', 'min.node.size', 'replace', 'sample.fraction'),
+                                  class = c('numeric', 'numeric', 'numeric', 'logical', 'numeric'),
+                                  label = c('num.trees', 'mtry', 'min.node.size', 'replace', 'sample.fraction'))
+
+customRF$grid <- function(x, y, len = NULL, search = 'grid') {}
+
+customRF$fit <- function(x, y, wts, param, lev, last, weights, classProbs) {
+  ranger::ranger(x = x,
+                 y = y,
+                 num.trees       = param$num.trees,
+                 mtry            = param$mtry,
+                 min.node.size   = param$min.node.size,
+                 replace         = param$replace,
+                 sample.fraction = param$sample.fraction)
+}
+
+customRF$predict <- function(modelFit, newdata, preProc = NULL, submodels = NULL)
+   predict(modelFit, newdata)$predictions
+
+customRF$prob <- function(modelFit, newdata, preProc = NULL, submodels = NULL)
+   NULL
+
+customRF$sort <- function(x) x[order(x[,1]),]
+
+customRF$levels <- NULL
+```
+
+```{r}
+#design hyperparameter search grid for RF
+hyper_grid_customRF <- expand.grid(
+  num.trees = n_features*10,
+  mtry = floor(n_features*c(.25,.333,.63,.9)),
+  min.node.size = c(1,5,10),
+  replace = FALSE,
+  sample.fraction = c(.25,.4,.63)
+)
+
+#perform RF on all variables selected
+set.seed(7027008)
+movies_ratings_customRF <- train(
+  blueprint,
+  data = movies_ratings_train,
+  method = customRF,
+  trControl = cv,
+  tuneGrid = hyper_grid_customRF,
+  metric = 'RMSE'
+)
+```
+
+### basic GBM
+
+```{r}
+#firstly, we run a basic GBM model with learning rate 0.1, #Trees = 7000, Tree depth = 3, min node size = 10
+##Note: for consistency purpose and shorten the running time, we use 5-fold cv for the analysis
+set.seed(7027007)
+system.time(movies_ratings_GBM <- gbm(
+  formula = avg_vote ~.,
+  data = movies_ratings_bakedtrain,
+  distribution = "gaussian",
+  n.trees = 7000,
+  shrinkage = 0.1,
+  interaction.depth = 3,
+  n.minobsinnode = 10,
+  cv.folds = 5
+))
+```
+
+```{r}
+#generate the index for number trees with min CV error and get the RMSE
+best_GBM <- which.min(movies_ratings_GBM$cv.error)
+rmse_best_GBM <- sqrt(movies_ratings_GBM$cv.error[best_GBM])
+rmse_best_GBM
+```
+
+```{r}
+#plot the error curve
+gbm.perf(movies_ratings_GBM, method = "cv")
+```
+
+```{r}
+#then we fix the tree hyperparameters and tune the learning rate
+##Note: due to long running time for our computers, here we use 5 learning rate for tuning with 5-fold cross-validation
+hyper_grid_GBM <- expand.grid(
+  learning_rate = c(0.3, 0.1, 0.05, 0.01, 0.005),
+  RMSE = NA,
+  trees = NA,
+  time = NA
+)
+```
+
+```{r}
+#execute grid search and fit the gbm
+for (i in seq_len(nrow(hyper_grid_GBM))) {
+  set.seed(7027008)
+  train_time <- system.time({
+    m <- gbm(
+      formula = avg_vote ~.,
+      data = movies_ratings_bakedtrain,
+      distribution = "gaussian",
+      n.trees = 7000,
+      shrinkage = hyper_grid_GBM$learning_rate[i],
+      interaction.depth = 3,
+      n.minobsinnode = 10,
+      cv.folds = 5
+    )
+  })
+  #add SSE, trees, and training time to results
+  hyper_grid_GBM$RMSE[i] <- sqrt(min(m$cv.error))
+  hyper_grid_GBM$trees[i] <- which.min(m$cv.error)
+  hyper_grid_GBM$time[i] <- train_time[["elapsed"]]
+  print("done")
+}
+```
+
+```{r}
+arrange(hyper_grid_GBM, RMSE)
+```
+
+From the above summary, learning rate 0.05 is sufficient, which requires 6998 trees. RMSE is around 0.7944, which is smaller as when the learning rate at 0.1 as above. All model's time is comparable.
+
+```{r}
+#tune tree-specific parameters for the decided learning rate 0.05
+##Note: due to long running time for my computer, here I use 3 tree depth and 3 node size for tuning with 5-fold cross-validation
+hyper_grid_GBM2 <- expand.grid(
+  interaction.depth = c(3,5,7),
+  n.minobsinnode = c(5,10,15)
+)
+```
+
+```{r}
+#create model fit function
+model_fit_GBM <- function(interaction.depth, n.minobsinnode){
+  set.seed(7027009)
+  m <- gbm(
+    formula = avg_vote ~.,
+    data = movies_ratings_bakedtrain,
+    distribution = "gaussian",
+    n.trees = 7000,
+    shrinkage = 0.05,
+    interaction.depth = interaction.depth,
+    n.minobsinnode = n.minobsinnode,
+    cv.folds = 5
+  )
+  #compute RMSE
+  sqrt(min(m$cv.error))
+}
+```
+
+```{r}
+#perform search grid with functional programming
+hyper_grid_GBM2$rmse <- purrr::pmap_dbl(
+  hyper_grid_GBM2,
+  ~model_fit_GBM(
+    interaction.depth = ..1,
+    n.minobsinnode = ..2
+  )
+)
+```
+
+```{r}
+arrange(hyper_grid_GBM2, rmse)
+```
+
+From the above summary, when learning rate fixed at 0.05, RMSE is smallest as 0.07772 when tree depth is 7 and node size of 15. To better choose the best GBM model, we repeat the above step again with the tree depth and node size obtained.
+
+```{r}
+#now we fix the tree depth as 7 and node size as 15 and tune the learning rate
+##Note: due to long running time for my computer, here I use 5 learning rate for tuning with 5-fold cross-validation
+hyper_grid_GBM3 <- expand.grid(
+  learning_rate = c(0.3,0.1,0.05,0.01,0.005),
+  RMSE = NA,
+  trees = NA,
+  time = NA
+)
+```
+
+```{r}
+#execute grid search and fit the gbm
+for (i in seq_len(nrow(hyper_grid_GBM3))) {
+  set.seed(7027012)
+  train_time <- system.time({
+    m <- gbm(
+      formula = avg_vote ~.,
+      data = movies_ratings_bakedtrain,
+      distribution = "gaussian",
+      n.trees = 7000,
+      shrinkage = hyper_grid_GBM3$learning_rate[i],
+      interaction.depth = 7,
+      n.minobsinnode = 15,
+      cv.folds = 5
+    )
+  })
+  #add SSE, trees, and training time to results
+  hyper_grid_GBM3$RMSE[i] <- sqrt(min(m$cv.error))
+  hyper_grid_GBM3$trees[i] <- which.min(m$cv.error)
+  hyper_grid_GBM3$time[i] <- train_time[["elapsed"]]
+  print("done")
+}
+```
+
+```{r}
+arrange(hyper_grid_GBM3, RMSE)
+```
+
+The above result demonstrates that the best model was achieved when the learning rate is 0.05 (same as the first trial), which requires 5797 trees and RMSE is around 0.7789. Hence, we could rely on the first trial and the best learning rate is 0.05, tree depth is 7, node size is 15.
+
+### XGBoost
+
+Here we build the Xgboost with the best basic GBM model we obtained above.
+
+```{r}
+#convert the features to numerical matrix and response to vector
+X <- as.matrix(movies_ratings_bakedtrain[setdiff(names(movies_ratings_bakedtrain), "avg_vote")])
+Y <- movies_ratings_bakedtrain$avg_vote
+```
+
+```{r}
+#we start with the parameters as below on the best GBM model obtained from above
+##Note: due to long running time for our computers, here we use 5 learning rate for tuning with 5-fold cross-validation
+set.seed(7027011)
+model_fit_XGB <-xgb.cv(
+  data = X,
+  label = Y,
+  nrounds = 7000,
+  objective = "reg:squarederror",
+  early_stopping_rounds = 50,
+  nfold = 5,
+  params = list(
+    eta = 0.05,
+    max_depth = 7,
+    min_child_weight = 15,
+    subsample = 0.5,
+    colsample_bytree = 0.5),
+  verbose = 0
+)
+```
+
+```{r}
+#obtain the minimum CV RMSE
+min(model_fit_XGB$evaluation_log$test_rmse_mean)
+```
+
+```{r}
+#set the hyperparameter grid for tuning the XGBoost model
+##Note: due to the long running time for our computers, here we tune 4 possible value for each hyper parameters (gamma, lambda and alpha)
+hyper_grid_XGB <- expand.grid(
+  eta = 0.05,
+  max_depth = 7,
+  min_child_weight = 15,
+  subsample = 0.5,
+  colsample_bytree = 0.5,
+  gamma = c(0,1,10,100),
+  lambda = c(0,1,10,100),
+  alpha = c(0,1,10,100),
+  rmse = 0,
+  trees = 0
+)
+```
+
+```{r}
+#perform grid search to tune the hyperparameters
+##Note: due to the long running time for our computer, here we use 5-fold cross-validation to tune the hyper parameters
+for (i in seq_len(nrow(hyper_grid_XGB))) {
+  set.seed(7027009)
+  model_fit_XGB2 <- xgb.cv(
+    data = X,
+    label = Y,
+    nrounds = 7000,
+    objective = "reg:squarederror",
+    early_stopping_rounds = 50,
+    nfold = 5,
+    verbose = 0,
+    params = list(
+      eta = hyper_grid_XGB$eta[i],
+      max_depth = hyper_grid_XGB$max_depth[i],
+      min_child_weight = hyper_grid_XGB$min_child_weight[i],
+      subsample = hyper_grid_XGB$subsample[i],
+      colsample_bytree = hyper_grid_XGB$colsample_bytree[i],
+      gamma = hyper_grid_XGB$gamma[i],
+      lambda = hyper_grid_XGB$lambda[i],
+      alpha = hyper_grid_XGB$alpha[i]
+    )
+  )
+  hyper_grid_XGB$rmse[i] <- min(model_fit_XGB2$evaluation_log$test_rmse_mean)
+  hyper_grid_XGB$trees[i] <- model_fit_XGB2$best_iteration
+}
+```
+
+```{r}
+arrange(hyper_grid_XGB, rmse)
+```
+
+# Step 5: Performance Evaluation
+
+## Linear Regression
+
+```{r}
+#obtain RMSE for linear regression on training data set
+movies_ratings_optLinear <- movies_ratings_Linear$finalModel
+movies_ratings_Linear$results %>% arrange(RMSE)
+```
+
+## KNN
+
+```{r}
+#obtain RMSE for the best KNN on training data set
+movies_ratings_optKNN <- movies_ratings_KNN$finalModel
+movies_ratings_KNN$results %>% arrange(RMSE)
+```
+
+## GAM Spline
+
+```{r}
+#obtain RMSE for the best GAM Spline on training data set
+movies_ratings_optgamSpline <- movies_ratings_gamSpline$finalModel
+movies_ratings_gamSpline$results %>% arrange(RMSE)
+```
+
+## GAM
+
+```{r warning = FALSE}
+#obtain RMSE for the GAM model on training data set
+set.seed(7027100)
+sqrt(cv.glm(movies_ratings_bakedtrain, fit.gam, K = 10)$delta)
+```
+
+## RF
+
+```{r}
+#obtain RMSE for the best RF on training data set
+movies_ratings_optcustomRF <- movies_ratings_customRF$finalModel
+movies_ratings_customRF$results %>% arrange(RMSE) %>% head(10)
+```
+
+## Basic GBM
+
+```{r}
+#obtain RMSE for the best basic GBM on training data set
+arrange(hyper_grid_GBM3, RMSE)
+```
+
+## XGBoost
+
+```{r}
+#obtain RMSE for the best XGBoost on training data set
+arrange(hyper_grid_XGB, rmse)
+```
+
+From the above performance evaluation, XGBoost generated the best CV RMSE of 0.77 and hence was chosen as the final model to predict the test data. 
+
+# Step 6: Final Model Generation and Test Data Evaluation
+
+```{r}
+#we fit the final XGBoost model with the hyper parameters after tuning
+set.seed(7027010)
+model_fit_XGBfinal <-xgboost(
+  data = X,
+  label = Y,
+  nrounds = 5000,
+  objective = "reg:squarederror",
+  early_stopping_rounds = 50,
+  params = list(
+    eta = 0.05,
+    max_depth = 7,
+    min_child_weight = 15,
+    subsample = 0.5,
+    colsample_bytree = 0.5,
+    gamma = 0,
+    lambda = 100,
+    alpha = 1),
+  verbose = 0
+)
+```
+
+```{r}
+#convert the features to numerical matrix and response to vector for test data set
+X_test = as.matrix(movies_ratings_bakedtest[setdiff(names(movies_ratings_bakedtest), "avg_vote")])
+Y_test <- movies_ratings_bakedtest$avg_vote
+```
+
+```{r}
+#make prediction on test data set
+Y_pred <- predict(model_fit_XGBfinal, X_test)
+```
+
+```{r}
+#compare the cross-validated RMSE for training data set and RMSE for test data set
+test_rmse = RMSE(Y_pred, Y_test)
+summary <- data.frame("Data" = c("train_cross_validated", "test"), RMSE = c(arrange(hyper_grid_XGB, rmse)$rmse[1], test_rmse))
+summary
+```
+
+# Step 7: Feature Importance Analysis 
+
+## VIP Graph
+
+```{r}
+#draw the VIP graph
+vip(model_fit_XGBfinal, scale = TRUE, num_features = 40)
+```
+
+## PDP Plots
+
+```{r}
+#obtain the PDP Plots for the top 9 important variables
+pdp::partial(model_fit_XGBfinal$handle, pred.var = "votes", train = X, plot = TRUE)
+pdp::partial(model_fit_XGBfinal$handle, pred.var = "year", train = X, plot = TRUE)
+pdp::partial(model_fit_XGBfinal$handle, pred.var = "votes_pct_18age", train = X, plot = TRUE)
+pdp::partial(model_fit_XGBfinal$handle, pred.var = "votes_pct_45age", train = X, plot = TRUE)
+pdp::partial(model_fit_XGBfinal$handle, pred.var = "duration", train = X, plot = TRUE)
+pdp::partial(model_fit_XGBfinal$handle, pred.var = "votes_pct_male", train = X, plot = TRUE)
+pdp::partial(model_fit_XGBfinal$handle, pred.var = "votes_pct_female", train = X, plot = TRUE)
+pdp::partial(model_fit_XGBfinal$handle, pred.var = "votes_pct_30age", train = X, plot = TRUE)
+pdp::partial(model_fit_XGBfinal$handle, pred.var = "bigshot_importance", train = X, plot = TRUE)
+```
+
+```{r}
+#to futher analyze the variables importance and provide recommendation in our project, we obtain the PDP Plots for more movie characteristics variables
+pdp::partial(model_fit_XGBfinal$handle, pred.var = "Horror", train = X, plot = TRUE)
+pdp::partial(model_fit_XGBfinal$handle, pred.var = "Drama", train = X, plot = TRUE)
+pdp::partial(model_fit_XGBfinal$handle, pred.var = "English", train = X, plot = TRUE)
+pdp::partial(model_fit_XGBfinal$handle, pred.var = "month", train = X, plot = TRUE)
+pdp::partial(model_fit_XGBfinal$handle, pred.var = "USA", train = X, plot = TRUE)
+pdp::partial(model_fit_XGBfinal$handle, pred.var = "Action", train = X, plot = TRUE)
+```
+
+# Step 8: Conclusions and Limitations Analysis
+
+The below process was performed to use the 11% data, which have both income and budget information in USD, to analyze the linear regression model result with and without income and budget.
+
+## Data Loading 
+
+```{r}
+##load the movie ratings csv data file generated from Python after processing the 4 row data tables and visualize the data structure
+movies_ratings_data <- read.csv('imdb_movie_ratings_1214.csv')
+str(movies_ratings_data,list.len=ncol(movies_ratings_data))
+```
+
+## Data Wrangling
+
+```{r}
+#delete columns with too many missing values but include the variables "adjust_budget_usd" and "adjust_worlwide_income_usd"
+movies_ratings_data_con <- subset(movies_ratings_data,select=-c(imdb_title_id,metascore,votes_pct_0age))
+movies_ratings_data_con$bigshot_importance[is.na(movies_ratings_data_con$bigshot_importance)] <- 0
+
+apply(movies_ratings_data_con, 2, function(x) sum(is.na(x)))
+```
+
+```{r}
+#visualze the data structure again after data wrangling
+str(movies_ratings_data_con,list.len=ncol(movies_ratings_data_con))
+```
+
+```{r}
+hist(movies_ratings_data$avg_vote)
+```
+
+## Data Splitting
+
+```{r}
+#drop the rows without the information of "adjust_budget_usd" and "adjust_worlwide_income_usd"
+movies_ratings_data_con <- movies_ratings_data_con %>% drop_na(adjust_budget_usd) %>% drop_na(adjust_worlwide_income_usd)
+```
+
+```{r}
+#perform training-test splitting (stratified, 6/4) and visualize the train and test data structure 
+set.seed(7027001)
+movies_ratings_data_con_stratsplit <- initial_split(movies_ratings_data_con,prop=0.6,strata='avg_vote')
+movies_ratings_con_train <- training(movies_ratings_data_con_stratsplit)
+movies_ratings_con_test <- testing(movies_ratings_data_con_stratsplit)
+str(movies_ratings_con_train)
+str(movies_ratings_con_test)
+```
+
+```{r}
+#check stratified sampling for means and variances of the response variable in the training/test sets
+mean(movies_ratings_con_train$avg_vote)
+mean(movies_ratings_con_test$avg_vote)
+var(movies_ratings_con_train$avg_vote)
+var(movies_ratings_con_test$avg_vote)
+```
+
+## Data Preprocessing on Training Set
+
+```{r}
+#set "avg_vote" as response and other variables as predictors
+response <- 'avg_vote'
+predictors <- setdiff(colnames(movies_ratings_con_train),response)
+n_features <- length(predictors)
+```
+
+```{r}
+#select the one hot variables to be eliminated from normalization in the blueprint
+predictors_onehot_con <- 
+  c(colnames(movies_ratings_con_train)[which(colnames(movies_ratings_con_train)=='Action'):which(colnames(movies_ratings_con_train)=='Studio_Other')])
+
+#create the blueprint
+blueprint_con <- recipe(avg_vote~.,data=movies_ratings_con_train) %>%
+  step_nzv(all_predictors(),-c(predictors_onehot_con,director_writer)) %>%
+  step_impute_mean(all_predictors()) %>% 
+  step_log(all_numeric_predictors(),-c(predictors_onehot_con,director_writer),offset=1) %>% 
+  step_center(all_numeric_predictors(),-c(predictors_onehot_con,director_writer)) %>%
+  step_scale(all_numeric_predictors(),-c(predictors_onehot_con,director_writer)) %>% 
+  step_dummy(all_nominal_predictors(),one_hot=T)
+```
+
+
+```{r}
+#prepare baked training/test data
+prepare_con <- prep(blueprint_con,training=movies_ratings_con_train)
+
+movies_ratings_con_bakedtrain <- bake(prepare_con,new_data=movies_ratings_con_train)
+movies_ratings_con_bakedtest <- bake(prepare_con,new_data=movies_ratings_con_test)
+
+#visualise the baked training/test data structure
+str(movies_ratings_con_bakedtrain)
+str(movies_ratings_con_bakedtest)
+```
+
+## Resampling Method
+
+```{r}
+#set our resampling method to be a 5-fold cross-validation of 1-repeat in light of the large IMDb data set
+cv <- trainControl(
+  method='repeatedcv',
+  number=5,
+  repeats=1
+)
+```
+
+## Model Training
+
+```{r,warning=FALSE}
+#perform linear regression with budget and income
+set.seed(7027002)
+movies_ratings_con_Linear_with <- train(
+  avg_vote~.,
+  data=movies_ratings_con_bakedtrain,
+  method='lm',
+  trControl=cv,
+  metric='RMSE'
+)
+```
+
+```{r}
+#visualise the linear regression result with budget and income
+summary(movies_ratings_con_Linear_with)
+```
+
+```{r,warning=FALSE}
+#perform linear regression without budget with income
+set.seed(7027002)
+movies_ratings_con_Linear_without <- train(
+  avg_vote~.,
+  data=subset(movies_ratings_con_bakedtrain, select = -c(adjust_budget_usd)),
+  method='lm',
+  trControl=cv,
+  metric='RMSE'
+)
+```
+
+```{r}
+#visualise the linear regression result without budget with income
+summary(movies_ratings_con_Linear_without)
+```
+
+```{r,warning=FALSE}
+#perform linear regression without income with budget
+set.seed(7027002)
+movies_ratings_con_Linear_without2 <- train(
+  avg_vote~.,
+  data=subset(movies_ratings_con_bakedtrain, select = -c(adjust_worlwide_income_usd)),
+  method='lm',
+  trControl=cv,
+  metric='RMSE'
+)
+```
+
+```{r}
+#visualise the linear regression result without income with budget
+summary(movies_ratings_con_Linear_without2)
+```
+
+```{r,warning=FALSE}
+#perform linear regression without income and budget
+set.seed(7027002)
+movies_ratings_con_Linear_without3 <- train(
+  avg_vote~.,
+  data=subset(movies_ratings_con_bakedtrain, select = -c(adjust_worlwide_income_usd,adjust_budget_usd)),
+  method='lm',
+  trControl=cv,
+  metric='RMSE'
+)
+```
+
+```{r}
+#visualise the linear regression result without income and budget
+summary(movies_ratings_con_Linear_without3)
+```
+
+# Appendix - De-normalization and De-standardization for variables
+
+## year
+
+```{r}
+#obtain the "U-turn" point for variable "year"
+mu <- mean(log(movies_ratings_train$year+1))
+sigma <- sd(log(movies_ratings_train$year+1))
+exp(.95*sigma+mu)-1
+```
+
+## duration
+
+```{r}
+#obtain the turning points for variable "duration"
+mu <- mean(log(movies_ratings_train$duration+1))
+sigma <- sd(log(movies_ratings_train$duration+1))
+exp(-1*sigma+mu)-1
+exp(4*sigma+mu)-1
+```
+
+## votes_pct_male
+
+```{r}
+#obtain the turning points for variable "percentage of votes by male users"
+votes_pct_male <- movies_ratings_train$votes_pct_male
+impute_mean <- mean(na.omit(votes_pct_male))
+votes_pct_male[which(is.na(votes_pct_male))] <- impute_mean
+
+mu <- mean(log(votes_pct_male+1))
+sigma <- sd(log(votes_pct_male+1))
+exp(-4*sigma+mu)-1
+```
+
+## votes_pct_female
+
+```{r}
+#obtain the turning points for variable "percentage of votes by female users"
+votes_pct_female <- movies_ratings_train$votes_pct_female
+impute_mean <- mean(na.omit(votes_pct_female))
+votes_pct_female[which(is.na(votes_pct_female))] <- impute_mean
+
+mu <- mean(log(votes_pct_female+1))
+sigma <- sd(log(votes_pct_female+1))
+exp(0*sigma+mu)-1
+exp(4*sigma+mu)-1
+```
+
+## month
+
+```{r}
+#obtain the turning points for variable "month"
+mu <- mean(log(movies_ratings_train$month+1))
+sigma <- sd(log(movies_ratings_train$month+1))
+exp(0.924969793709172*sigma+mu)-1
+levels(as.factor(movies_ratings_bakedtrain$month))
+```
+
